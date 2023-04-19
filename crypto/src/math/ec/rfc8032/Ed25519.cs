@@ -1,14 +1,18 @@
 ﻿using System;
 using System.Diagnostics;
-
+using Org.BouncyCastle.Bcpg.Sig;
 using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Digests;
+using Org.BouncyCastle.Crypto.Fpe;
+using Org.BouncyCastle.Crypto.Paddings;
 using Org.BouncyCastle.Math.Raw;
+using Org.BouncyCastle.Pqc.Crypto.SphincsPlus;
 using Org.BouncyCastle.Security;
 using Org.BouncyCastle.Utilities;
 
 namespace Org.BouncyCastle.Math.EC.Rfc8032
 {
+    using static Org.BouncyCastle.Pqc.Crypto.Picnic.Signature;
     using F = Rfc7748.X25519Field;
 
     /// <summary>
@@ -528,6 +532,79 @@ namespace Org.BouncyCastle.Math.EC.Rfc8032
 
             return ExportPoint(ref q);
 #endif
+        }
+
+        public static bool BlindPublicKey(byte[] pk, int pkOff, byte[] param, int paramOff, byte[] r, int rOff)
+        {
+            byte[] A = Copy(pk, pkOff, PublicKeySize);
+            byte[] S = Copy(param, paramOff, ScalarBytes);
+
+            if (!CheckPointFullVar(A))
+                return false;
+
+            var prunedScalar = new byte[ScalarBytes];
+            PruneScalar(S, 0, prunedScalar);
+
+            Init(out PointAffine pA);
+            if (!DecodePointVar(A, false, ref pA))
+                return false;
+
+            Init(out PointAccum pR);
+            ScalarMult (prunedScalar, ref pA, ref pR);
+
+            if (0 == EncodeResult(ref pR, r, rOff))
+                return false;
+
+            return true;
+        }
+
+        public static byte[] BlindPrivateKey(byte[] expandedSecretKey, int expandedSecretKeyOff, byte[] param, int paramOff, string prefixMsg)
+        {
+            var blindingFactor = new byte[ScalarBytes];
+            PruneScalar(param, paramOff, blindingFactor);
+
+            var secretKeyLeftHalf = Copy(expandedSecretKey, expandedSecretKeyOff, 32);
+            var secretKeyRightHalf = Copy(expandedSecretKey, expandedSecretKeyOff + 32, 32);
+
+            var zeros = new byte[ScalarBytes * 2];
+            var output = CalculateS(zeros, secretKeyLeftHalf, blindingFactor);
+
+            var hasher = CreateDigest();
+            var prefixMsgInBytes = System.Text.Encoding.ASCII.GetBytes(prefixMsg);
+            hasher.BlockUpdate(prefixMsgInBytes, 0, prefixMsgInBytes.Length);
+            hasher.BlockUpdate(secretKeyRightHalf, 0, 32);
+
+            byte[] newRH = new byte[hasher.GetDigestSize()];
+            hasher.DoFinal(newRH, 0);
+            Array.Copy(newRH, 0, output, 32, 32);
+
+            return output;
+        }
+
+        public static byte[] Ed25519PublicKeyFromCurve25519(byte[] publicKey, int publicKeyOff, bool signbit)
+        {
+            byte[] A = Copy(publicKey, publicKeyOff, PublicKeySize);
+
+            var u = F.Create();
+            F.Decode(A, u);
+            var one = F.Create();
+            F.One(one);
+            var uminus1 = F.Create();
+            F.Sub(u, one, uminus1);
+            var uplus1 = F.Create();
+            F.Add(u, one, uplus1);
+            var invUPlus1 = F.Create();
+            F.Inv(uplus1, invUPlus1);
+            var y = F.Create();
+            F.Mul(uminus1, invUPlus1, y);
+
+            byte[] output = new byte[PublicKeySize];
+            F.Normalize(y);
+            F.Encode(y, output);
+
+            output[31] |= (byte)(Convert.ToInt32(!!signbit) << 7);
+
+            return output;
         }
 
 #if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
@@ -1758,6 +1835,33 @@ namespace Org.BouncyCastle.Math.EC.Rfc8032
             // NOTE: Together with the final PointDouble of the loop, this clears the cofactor of 8
             PointDouble(ref r);
             PointDouble(ref r);
+        }
+        public static void SignByExtendedKey(byte[] extendedSecretKey, byte[] pk, int pkOff, byte[] m, int mOff, int mLen, byte[] sig, int sigOff)
+        {
+            byte[] s = Copy(extendedSecretKey, 0, ScalarBytes);
+
+
+            IDigest d = CreateDigest();
+            byte[] h = new byte[d.GetDigestSize()];
+            d.BlockUpdate(extendedSecretKey, ScalarBytes, ScalarBytes);
+            d.BlockUpdate(m, mOff, mLen);
+            d.DoFinal(h, 0);
+
+            byte[] r = Scalar25519.Reduce(h);
+            byte[] R = new byte[PointBytes];
+            ScalarMultBaseEncoded(r, R, 0);
+
+            d.BlockUpdate(R, 0, PointBytes);
+            d.BlockUpdate(pk, pkOff, PointBytes);
+            d.BlockUpdate(m, mOff, mLen);
+            d.DoFinal(h, 0);
+
+            byte[] k = Scalar25519.Reduce(h);
+            byte[] S = CalculateS(r, k, s);
+
+            Array.Copy(R, 0, sig, sigOff, PointBytes);
+            Array.Copy(S, 0, sig, sigOff + PointBytes, ScalarBytes);
+
         }
 
         public static void Sign(byte[] sk, int skOff, byte[] m, int mOff, int mLen, byte[] sig, int sigOff)
